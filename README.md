@@ -26,7 +26,7 @@ Add to `~/.tmux.conf`:
 
 ```tmux
 set -g @plugin 'tmux-plugins/tmux-resurrect'
-set -g @plugin 'samleeney/tmux-claude-resurrect'
+set -g @plugin 'napter/tmux-claude-resurrect'
 ```
 
 Then press `prefix + I` to install.
