@@ -21,16 +21,26 @@ sessions=()
 while IFS= read -r line; do
     pane_pid=$(echo "$line" | cut -d' ' -f1)
     pane_id=$(echo "$line" | cut -d' ' -f2)
+    pane_cmd=$(echo "$line" | cut -d' ' -f3)
     pane_number="${pane_id#%}"
 
-    # Check if claude is an active child process of this pane's shell
-    if ! pgrep -P "$pane_pid" -f "claude" >/dev/null 2>&1; then
+    # Detect Claude: either as the direct pane command, or as a child process
+    # Note: pane_current_command shows the foreground process name (works even
+    # if claude is deep in the process tree, e.g. zsh->chezmoi->zsh->claude)
+    is_claude=false
+    if [ "$pane_cmd" = "claude" ]; then
+        is_claude=true
+    elif pgrep -P "$pane_pid" -x "claude" >/dev/null 2>&1; then
+        is_claude=true
+    fi
+    if [ "$is_claude" = false ]; then
         continue
     fi
 
     # Check for cached pane mapping
     pane_file="${PANES_DIR}/${pane_number}.json"
     if [ ! -f "$pane_file" ]; then
+        echo "tmux-claude-resurrect: WARNING: Claude in pane %${pane_number} has no cache file (SessionStart hook may not have fired)" >&2
         continue
     fi
 
@@ -44,7 +54,7 @@ while IFS= read -r line; do
     # Read the pane mapping
     pane_data=$(cat "$pane_file")
     sessions+=("$pane_data")
-done < <(tmux list-panes -a -F '#{pane_pid} #{pane_id}' 2>/dev/null)
+done < <(tmux list-panes -a -F '#{pane_pid} #{pane_id} #{pane_current_command}' 2>/dev/null)
 
 # Build consolidated snapshot
 snapshot_file="${SNAPSHOTS_DIR}/claude-sessions.json"

@@ -44,6 +44,16 @@ for s in snapshot.get('sessions', []):
         continue
     fi
 
+    # Skip if Claude is already running in this pane
+    pane_pid=$(tmux display-message -t "$address" -p '#{pane_pid}')
+    pane_cmd=$(tmux display-message -t "$address" -p '#{pane_current_command}')
+    if [ "$pane_cmd" = "claude" ]; then
+        continue
+    fi
+    if pgrep -P "$pane_pid" -x "claude" >/dev/null 2>&1; then
+        continue
+    fi
+
     # Verify transcript file still exists
     if [ -n "$transcript_path" ] && [ ! -f "$transcript_path" ]; then
         continue

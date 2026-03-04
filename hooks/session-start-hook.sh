@@ -40,7 +40,14 @@ pane_pid=$(tmux display-message -t "$TMUX_PANE" -p '#{pane_pid}')
 claude_cmdline=""
 if [ -n "$pane_pid" ]; then
     # Find claude process among children
-    claude_pid=$(pgrep -P "$pane_pid" -f "claude" 2>/dev/null | head -1) || true
+    claude_pid=$(pgrep -P "$pane_pid" -x "claude" 2>/dev/null | head -1) || true
+    # Fallback: claude may BE the pane process (no parent shell)
+    if [ -z "$claude_pid" ]; then
+        pane_cmd_check=$(tr '\0' ' ' < "/proc/$pane_pid/cmdline" 2>/dev/null || ps -p "$pane_pid" -o args= 2>/dev/null) || true
+        if [[ "${pane_cmd_check:-}" == *claude* ]]; then
+            claude_pid="$pane_pid"
+        fi
+    fi
     if [ -n "$claude_pid" ]; then
         claude_cmdline=$(tr '\0' ' ' < "/proc/$claude_pid/cmdline" 2>/dev/null) || \
         claude_cmdline=$(ps -p "$claude_pid" -o args= 2>/dev/null) || true
