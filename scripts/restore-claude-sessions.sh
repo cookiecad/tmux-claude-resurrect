@@ -1,9 +1,19 @@
 #!/usr/bin/env bash
-# Restores Claude sessions from a snapshot.
+# Restores Claude and Codex sessions from a snapshot.
 # Called by tmux-resurrect post-restore hook (auto) or by the picker (manual).
-# Usage: restore-claude-sessions.sh [snapshot-file]
+# Usage: restore-claude-sessions.sh [--with-resurrect] [snapshot-file]
 
 set -euo pipefail
+
+# Parse flags
+with_resurrect=false
+snapshot_file=""
+for arg in "$@"; do
+    case "$arg" in
+        --with-resurrect) with_resurrect=true ;;
+        *) snapshot_file="$arg" ;;
+    esac
+done
 
 # Read tmux options
 auto_restore=$(tmux show-option -gqv @claude-resurrect-auto-restore)
@@ -17,10 +27,8 @@ restore_delay="${restore_delay:-2}"
 RESURRECT_DIR="${HOME}/.tmux/resurrect"
 SNAPSHOTS_DIR="${HOME}/.cache/tmux-claude-resurrect/snapshots"
 
-snapshot_file="${1:-}"
-
 if [ -z "$snapshot_file" ]; then
-    # Find the most recent non-empty snapshot (skips post-OOM empty saves)
+    # Find the most recent non-empty snapshot (skips post-disaster empty saves)
     snapshot_file=$(python3 -c "
 import json, sys, glob, os
 
@@ -54,6 +62,19 @@ if [ -z "$snapshot_file" ] || [ ! -f "$snapshot_file" ]; then
     exit 0
 fi
 
+# --- Optionally run tmux-resurrect restore first ---
+if [ "$with_resurrect" = true ]; then
+    resurrect_script="${HOME}/.tmux/plugins/tmux-resurrect/scripts/restore.sh"
+    if [ -f "$resurrect_script" ]; then
+        echo "Restoring tmux windows and panes..."
+        bash "$resurrect_script"
+        # Extra wait for resurrect to finish creating panes
+        sleep 3
+    else
+        echo "WARNING: tmux-resurrect not found at expected path" >&2
+    fi
+fi
+
 # Wait for shells to initialize
 sleep "$restore_delay"
 
@@ -63,54 +84,77 @@ import json, sys
 with open(sys.argv[1]) as f:
     snapshot = json.load(f)
 for s in snapshot.get('sessions', []):
+    entry_type = s.get('type', 'claude')
     project_root = s.get('project_root', '') or s.get('cwd', '')
-    print('{}\t{}\t{}\t{}\t{}\t{}'.format(
+    # Tab-separated: type, session_id, address, cwd, transcript_path, permission_mode, project_root, command
+    print('{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}'.format(
+        entry_type,
         s.get('session_id', ''),
         s.get('structural_address', ''),
         s.get('cwd', ''),
         s.get('transcript_path', ''),
         s.get('permission_mode', 'default'),
-        project_root
+        project_root,
+        s.get('command', '')
     ))
-" "$snapshot_file" | while IFS=$'\t' read -r session_id address cwd transcript_path permission_mode project_root; do
-    # Use project_root for cd (correct project resolution), fall back to cwd
-    restore_dir="${project_root:-$cwd}"
-
+" "$snapshot_file" | while IFS=$'\t' read -r entry_type session_id address cwd transcript_path permission_mode project_root command; do
     # Verify pane exists at this structural address
     if ! tmux display-message -t "$address" -p '#{pane_id}' >/dev/null 2>&1; then
         continue
     fi
 
-    # Skip if Claude is already running in this pane
+    # Skip if the target process is already running in this pane
     pane_cmd=$(tmux display-message -t "$address" -p '#{pane_current_command}')
-    if [ "$pane_cmd" = "claude" ]; then
+    if [ "$pane_cmd" = "claude" ] || [ "$pane_cmd" = "codex" ]; then
         continue
     fi
     pane_pid=$(tmux display-message -t "$address" -p '#{pane_pid}')
-    if pgrep -P "$pane_pid" -x "claude" >/dev/null 2>&1; then
+    if pgrep -P "$pane_pid" -x "claude" >/dev/null 2>&1 || pgrep -P "$pane_pid" -x "codex" >/dev/null 2>&1; then
         continue
     fi
 
-    # Verify transcript file still exists
-    if [ -n "$transcript_path" ] && [ ! -f "$transcript_path" ]; then
+    # Build the resume command based on entry type
+    cmd=""
+    restore_dir=""
+
+    if [ "$entry_type" = "claude" ]; then
+        # Verify transcript file still exists
+        if [ -n "$transcript_path" ] && [ ! -f "$transcript_path" ]; then
+            continue
+        fi
+
+        cmd="claude --resume $session_id"
+        if [ "$permission_mode" = "bypassPermissions" ]; then
+            cmd="$cmd --dangerously-skip-permissions"
+        elif [ -n "$permission_mode" ] && [ "$permission_mode" != "default" ]; then
+            cmd="$cmd --permission-mode $permission_mode"
+        fi
+
+        # Use project_root for correct project resolution
+        restore_dir="${project_root:-$cwd}"
+
+    elif [ "$entry_type" = "codex" ]; then
+        if [ -n "$session_id" ]; then
+            # Interactive codex session — resume by ID
+            cmd="codex resume $session_id"
+        elif [ -n "$command" ]; then
+            # Full-auto codex — re-run the captured command
+            cmd="$command"
+        else
+            continue
+        fi
+        restore_dir="$cwd"
+    else
         continue
     fi
 
-    # Build resume command
-    cmd="claude --resume $session_id"
-    if [ "$permission_mode" = "bypassPermissions" ]; then
-        cmd="$cmd --dangerously-skip-permissions"
-    elif [ -n "$permission_mode" ] && [ "$permission_mode" != "default" ]; then
-        cmd="$cmd --permission-mode $permission_mode"
-    fi
-
-    # cd to project_root if the pane isn't already there
+    # cd to the correct directory if needed
     pane_cwd=$(tmux display-message -t "$address" -p '#{pane_current_path}')
     if [ "$pane_cwd" != "$restore_dir" ] && [ -n "$restore_dir" ] && [ -d "$restore_dir" ]; then
         tmux send-keys -t "$address" "cd $(printf '%q' "$restore_dir")" C-m
         sleep 0.3
     fi
 
-    # Send the resume command
+    # Send the resume/run command
     tmux send-keys -t "$address" "$cmd" C-m
 done
