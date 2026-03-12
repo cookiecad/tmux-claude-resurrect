@@ -17,11 +17,28 @@ fi
 input=$(cat)
 
 # Extract fields using python3 (avoids jq dependency)
-read -r session_id cwd transcript_path < <(
+read -r session_id cwd transcript_path project_root < <(
     python3 -c "
-import json, sys
+import json, sys, os
 data = json.loads(sys.argv[1])
-print(data.get('session_id', ''), data.get('cwd', ''), data.get('transcript_path', ''))
+session_id = data.get('session_id', '')
+cwd = data.get('cwd', '')
+transcript_path = data.get('transcript_path', '')
+
+# Derive project_root: walk up from cwd to find the directory whose
+# slash-to-dash encoding matches the transcript_path's parent dir name.
+# e.g. /home/user/project → -home-user-project
+project_root = cwd  # fallback
+if transcript_path:
+    encoded_dir = os.path.basename(os.path.dirname(transcript_path))
+    candidate = cwd
+    while candidate and candidate != '/':
+        if candidate.replace('/', '-') == encoded_dir:
+            project_root = candidate
+            break
+        candidate = os.path.dirname(candidate)
+
+print(session_id, cwd, transcript_path, project_root)
 " "$input"
 )
 
@@ -71,8 +88,9 @@ data = {
     'structural_address': sys.argv[4],
     'pane_id': sys.argv[5],
     'permission_mode': sys.argv[6],
+    'project_root': sys.argv[7],
     'timestamp': time.time()
 }
 print(json.dumps(data, indent=2))
-" "$session_id" "$cwd" "$transcript_path" "$structural_address" "$pane_number" "$permission_mode" \
+" "$session_id" "$cwd" "$transcript_path" "$structural_address" "$pane_number" "$permission_mode" "$project_root" \
     > "${CACHE_DIR}/${pane_number}.json"

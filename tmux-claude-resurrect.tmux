@@ -32,3 +32,10 @@ fi
 if [ -z "$(tmux show-option -gqv @claude-resurrect-restore-delay)" ]; then
     tmux set-option -g @claude-resurrect-restore-delay "2"
 fi
+
+# Snapshot picker keybinding (default: prefix + R)
+picker_key=$(tmux show-option -gqv @claude-resurrect-picker-key)
+picker_key="${picker_key:-R}"
+
+tmux bind-key "$picker_key" popup -E -w '80%' -h '60%' \
+    "bash ${CURRENT_DIR}/scripts/pick-snapshot.sh"

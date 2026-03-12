@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # tmux-resurrect post-save hook
-# Snapshots all active Claude pane mappings into a consolidated file.
+# Creates timestamped Claude session snapshots with live structural addresses.
 
 set -euo pipefail
 
@@ -8,25 +8,21 @@ CACHE_DIR="${HOME}/.cache/tmux-claude-resurrect"
 PANES_DIR="${CACHE_DIR}/panes"
 SNAPSHOTS_DIR="${CACHE_DIR}/snapshots"
 RESURRECT_DIR="${HOME}/.tmux/resurrect"
+MAX_SNAPSHOTS=100
 
 mkdir -p "$SNAPSHOTS_DIR" "$RESURRECT_DIR"
 
-# Max age for cached pane files (7 days in seconds)
 MAX_AGE=$((7 * 24 * 60 * 60))
 now=$(date +%s)
 
 sessions=()
 
-# Iterate all tmux panes
-while IFS= read -r line; do
-    pane_pid=$(echo "$line" | cut -d' ' -f1)
-    pane_id=$(echo "$line" | cut -d' ' -f2)
-    pane_cmd=$(echo "$line" | cut -d' ' -f3)
+# Iterate all tmux panes — capture live structural address alongside pane metadata.
+# Using tab delimiter in tmux format string.
+while IFS=$'\t' read -r pane_pid pane_id pane_cmd live_address; do
     pane_number="${pane_id#%}"
 
     # Detect Claude: either as the direct pane command, or as a child process
-    # Note: pane_current_command shows the foreground process name (works even
-    # if claude is deep in the process tree, e.g. zsh->chezmoi->zsh->claude)
     is_claude=false
     if [ "$pane_cmd" = "claude" ]; then
         is_claude=true
@@ -37,10 +33,10 @@ while IFS= read -r line; do
         continue
     fi
 
-    # Check for cached pane mapping
+    # Check for cached pane mapping (written by SessionStart hook)
     pane_file="${PANES_DIR}/${pane_number}.json"
     if [ ! -f "$pane_file" ]; then
-        echo "tmux-claude-resurrect: WARNING: Claude in pane %${pane_number} has no cache file (SessionStart hook may not have fired)" >&2
+        echo "tmux-claude-resurrect: WARNING: Claude in pane %${pane_number} has no cache file" >&2
         continue
     fi
 
@@ -51,31 +47,47 @@ while IFS= read -r line; do
         continue
     fi
 
-    # Read the pane mapping
+    # Read cached data and pair with the live structural address
     pane_data=$(cat "$pane_file")
-    sessions+=("$pane_data")
-done < <(tmux list-panes -a -F '#{pane_pid} #{pane_id} #{pane_current_command}' 2>/dev/null)
+    sessions+=("${pane_data}|LIVE_ADDR:${live_address}")
+done < <(tmux list-panes -a -F '#{pane_pid}	#{pane_id}	#{pane_current_command}	#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null)
 
-# Build consolidated snapshot
-snapshot_file="${SNAPSHOTS_DIR}/claude-sessions.json"
+# Generate timestamped snapshot
+timestamp=$(date +%Y%m%d-%H%M%S)
+snapshot_file="${SNAPSHOTS_DIR}/snapshot-${timestamp}.json"
 
 python3 -c "
 import json, sys, time
 
 entries = []
 for arg in sys.argv[1:]:
+    # Split off live address appended by the shell loop
+    if '|LIVE_ADDR:' in arg:
+        json_part, live_addr = arg.rsplit('|LIVE_ADDR:', 1)
+    else:
+        json_part = arg
+        live_addr = None
     try:
-        entries.append(json.loads(arg))
+        entry = json.loads(json_part)
+        if live_addr:
+            entry['structural_address'] = live_addr
+        entries.append(entry)
     except json.JSONDecodeError:
         pass
 
 snapshot = {
-    'version': 1,
+    'version': 2,
     'timestamp': time.time(),
     'sessions': entries
 }
 print(json.dumps(snapshot, indent=2))
 " "${sessions[@]+"${sessions[@]}"}" > "$snapshot_file"
 
-# Also copy to resurrect dir so it travels with the resurrect state
+# Update 'latest' symlink (use basename so the link is relative)
+ln -sf "$(basename "$snapshot_file")" "${SNAPSHOTS_DIR}/latest"
+
+# Copy to resurrect dir for backward compatibility
 cp "$snapshot_file" "${RESURRECT_DIR}/claude-sessions.json"
+
+# Prune: keep last MAX_SNAPSHOTS, delete older ones
+ls -1t "${SNAPSHOTS_DIR}"/snapshot-*.json 2>/dev/null | tail -n +$((MAX_SNAPSHOTS + 1)) | xargs -r rm -f
