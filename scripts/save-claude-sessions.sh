@@ -112,16 +112,18 @@ print(json.dumps(data))
 
 done < <(tmux list-panes -a -F '#{pane_pid}	#{pane_id}	#{pane_current_command}	#{session_name}:#{window_index}.#{pane_index}	#{pane_current_path}' 2>/dev/null)
 
-# Generate timestamped snapshot
-timestamp=$(date +%Y%m%d-%H%M%S)
-snapshot_file="${SNAPSHOTS_DIR}/snapshot-${timestamp}.json"
-
+# Generate snapshot via python3 — skips writing if sessions haven't changed
 python3 -c "
-import json, sys, time
+import json, sys, time, os
 
+SNAPSHOTS_DIR = sys.argv[1]
+RESURRECT_DIR = sys.argv[2]
+MAX_SNAPSHOTS = int(sys.argv[3])
+raw_entries = sys.argv[4:]
+
+# Parse session entries from shell args
 entries = []
-for arg in sys.argv[1:]:
-    # Split off metadata appended by the shell loop
+for arg in raw_entries:
     parts = arg
     live_addr = None
     entry_type = 'claude'
@@ -135,26 +137,67 @@ for arg in sys.argv[1:]:
         entry = json.loads(parts)
         if live_addr:
             entry['structural_address'] = live_addr
-        # Ensure type field exists
         if 'type' not in entry:
             entry['type'] = entry_type
         entries.append(entry)
     except json.JSONDecodeError:
         pass
 
+# Compare against latest snapshot (ignoring timestamps)
+def session_fingerprint(sessions):
+    \"\"\"Canonical fingerprint of sessions, ignoring volatile fields.\"\"\"
+    stable = []
+    for s in sessions:
+        key = {k: v for k, v in s.items() if k != 'timestamp'}
+        stable.append(json.dumps(key, sort_keys=True))
+    return sorted(stable)
+
+latest_link = os.path.join(SNAPSHOTS_DIR, 'latest')
+if os.path.exists(latest_link):
+    try:
+        with open(latest_link) as f:
+            prev = json.load(f)
+        if session_fingerprint(prev.get('sessions', [])) == session_fingerprint(entries):
+            # No change — update timestamp in existing file and exit
+            prev['timestamp'] = time.time()
+            with open(latest_link, 'w') as f:
+                json.dump(prev, f, indent=2)
+            # Also update backward-compat copy
+            compat = os.path.join(RESURRECT_DIR, 'claude-sessions.json')
+            with open(compat, 'w') as f:
+                json.dump(prev, f, indent=2)
+            sys.exit(0)
+    except (json.JSONDecodeError, KeyError, OSError):
+        pass  # Corrupt or missing — write a fresh snapshot
+
+# Build and write new snapshot
 snapshot = {
     'version': 2,
     'timestamp': time.time(),
     'sessions': entries
 }
-print(json.dumps(snapshot, indent=2))
-" "${sessions[@]+"${sessions[@]}"}" > "$snapshot_file"
 
-# Update 'latest' symlink (use basename so the link is relative)
-ln -sf "$(basename "$snapshot_file")" "${SNAPSHOTS_DIR}/latest"
+timestamp = time.strftime('%Y%m%d-%H%M%S')
+snapshot_file = os.path.join(SNAPSHOTS_DIR, f'snapshot-{timestamp}.json')
+with open(snapshot_file, 'w') as f:
+    json.dump(snapshot, f, indent=2)
 
-# Copy to resurrect dir for backward compatibility
-cp "$snapshot_file" "${RESURRECT_DIR}/claude-sessions.json"
+# Update 'latest' symlink
+latest = os.path.join(SNAPSHOTS_DIR, 'latest')
+tmp_link = latest + '.tmp'
+os.symlink(os.path.basename(snapshot_file), tmp_link)
+os.rename(tmp_link, latest)
 
-# Prune: keep last MAX_SNAPSHOTS, delete older ones
-ls -1t "${SNAPSHOTS_DIR}"/snapshot-*.json 2>/dev/null | tail -n +$((MAX_SNAPSHOTS + 1)) | xargs -r rm -f
+# Backward compatibility copy
+compat = os.path.join(RESURRECT_DIR, 'claude-sessions.json')
+with open(compat, 'w') as f:
+    json.dump(snapshot, f, indent=2)
+
+# Prune old snapshots
+snaps = sorted(
+    [f for f in os.listdir(SNAPSHOTS_DIR) if f.startswith('snapshot-') and f.endswith('.json')],
+    reverse=True
+)
+for old in snaps[MAX_SNAPSHOTS:]:
+    os.remove(os.path.join(SNAPSHOTS_DIR, old))
+" "$SNAPSHOTS_DIR" "$RESURRECT_DIR" "$MAX_SNAPSHOTS" "${sessions[@]+"${sessions[@]}"}"

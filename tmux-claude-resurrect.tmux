@@ -15,6 +15,10 @@ chain_hook() {
     local current
     current=$(tmux show-option -gqv "$option")
     if [ -n "$current" ]; then
+        # Skip if already registered (prevents duplication on re-source)
+        case "$current" in
+            *"$command"*) return ;;
+        esac
         tmux set-option -g "$option" "${current} ; ${command}"
     else
         tmux set-option -g "$option" "$command"
