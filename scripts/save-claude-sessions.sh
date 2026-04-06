@@ -110,7 +110,12 @@ print(json.dumps(data))
         sessions+=("${codex_data}|LIVE_ADDR:${live_address}|TYPE:codex")
     fi
 
-done < <(tmux list-panes -a -F '#{pane_pid}	#{pane_id}	#{pane_current_command}	#{session_name}:#{window_index}.#{pane_index}	#{pane_current_path}' 2>/dev/null)
+# Iterate panes with a CANONICAL address (session_group name if the session is grouped,
+# else the session name). This collapses grouped-session clones — e.g., main, main-9,
+# main-14, main-15, main-16 all mapping to the same underlying panes — to a single
+# entry per unique pane_id, instead of storing N duplicates.
+done < <(tmux list-panes -a -F '#{pane_pid}	#{pane_id}	#{pane_current_command}	#{?session_grouped,#{session_group},#{session_name}}:#{window_index}.#{pane_index}	#{pane_current_path}' 2>/dev/null \
+    | awk -F'\t' '!seen[$2]++')
 
 # Generate snapshot via python3 — skips writing if sessions haven't changed
 python3 -c "
