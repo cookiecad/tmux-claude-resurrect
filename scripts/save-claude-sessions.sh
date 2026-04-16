@@ -15,6 +15,13 @@ mkdir -p "$SNAPSHOTS_DIR" "$RESURRECT_DIR"
 MAX_AGE=$((7 * 24 * 60 * 60))
 now=$(date +%s)
 
+# Resolve the tmux-resurrect state file that this save corresponds to, so the
+# snapshot can be re-paired with the correct tmux layout at restore time.
+paired_resurrect_file=""
+if [ -L "${RESURRECT_DIR}/last" ]; then
+    paired_resurrect_file="$(basename "$(readlink -f "${RESURRECT_DIR}/last" 2>/dev/null)" 2>/dev/null || true)"
+fi
+
 sessions=()
 
 # Iterate all tmux panes — capture live structural address alongside pane metadata.
@@ -124,7 +131,8 @@ import json, sys, time, os
 SNAPSHOTS_DIR = sys.argv[1]
 RESURRECT_DIR = sys.argv[2]
 MAX_SNAPSHOTS = int(sys.argv[3])
-raw_entries = sys.argv[4:]
+PAIRED_RESURRECT = sys.argv[4]
+raw_entries = sys.argv[5:]
 
 # Parse session entries from shell args
 entries = []
@@ -163,8 +171,9 @@ if os.path.exists(latest_link):
         with open(latest_link) as f:
             prev = json.load(f)
         if session_fingerprint(prev.get('sessions', [])) == session_fingerprint(entries):
-            # No change — update timestamp in existing file and exit
+            # No change — update timestamp and paired resurrect file, exit
             prev['timestamp'] = time.time()
+            prev['resurrect_file'] = PAIRED_RESURRECT
             with open(latest_link, 'w') as f:
                 json.dump(prev, f, indent=2)
             # Also update backward-compat copy
@@ -179,6 +188,7 @@ if os.path.exists(latest_link):
 snapshot = {
     'version': 2,
     'timestamp': time.time(),
+    'resurrect_file': PAIRED_RESURRECT,
     'sessions': entries
 }
 
@@ -205,4 +215,4 @@ snaps = sorted(
 )
 for old in snaps[MAX_SNAPSHOTS:]:
     os.remove(os.path.join(SNAPSHOTS_DIR, old))
-" "$SNAPSHOTS_DIR" "$RESURRECT_DIR" "$MAX_SNAPSHOTS" "${sessions[@]+"${sessions[@]}"}"
+" "$SNAPSHOTS_DIR" "$RESURRECT_DIR" "$MAX_SNAPSHOTS" "$paired_resurrect_file" "${sessions[@]+"${sessions[@]}"}"

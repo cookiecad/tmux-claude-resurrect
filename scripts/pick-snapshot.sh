@@ -7,8 +7,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SNAPSHOTS_DIR="${HOME}/.cache/tmux-claude-resurrect/snapshots"
+RESURRECT_DIR="${HOME}/.tmux/resurrect"
 RESTORE_SCRIPT="${SCRIPT_DIR}/restore-claude-sessions.sh"
 PREVIEW_SCRIPT="${SCRIPT_DIR}/preview-snapshot.sh"
+TMUX_RESURRECT_RESTORE="${HOME}/.tmux/plugins/tmux-resurrect/scripts/restore.sh"
 
 # Build list: one line per snapshot, tab-delimited: display | filepath
 entries=$(python3 -c "
@@ -122,12 +124,12 @@ if missing:
     print(' '.join(sorted(missing)))
 " "$chosen_file" 2>/dev/null) || true
 
-restore_flags=""
+run_resurrect=false
 if [ -n "$needs_resurrect" ]; then
     echo "Missing tmux sessions: $needs_resurrect"
     echo "Will run tmux-resurrect to create windows/panes first."
     echo ""
-    restore_flags="--with-resurrect"
+    run_resurrect=true
 fi
 
 # Count sessions for display
@@ -151,8 +153,34 @@ echo ""
 # Force auto-restore on (picker is explicit user intent)
 tmux set-option -g @claude-resurrect-auto-restore "on"
 
-# Run restore (optionally with resurrect first)
-bash "$RESTORE_SCRIPT" $restore_flags "$chosen_file"
+if [ "$run_resurrect" = true ] && [ -x "$TMUX_RESURRECT_RESTORE" ]; then
+    # Point `last` at the resurrect file paired with this snapshot, so
+    # tmux-resurrect recreates the tmux layout that matches our Claude sessions.
+    paired=$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+print(data.get('resurrect_file', ''))
+" "$chosen_file" 2>/dev/null || true)
+
+    if [ -n "$paired" ] && [ -f "${RESURRECT_DIR}/${paired}" ]; then
+        ln -sfn "$paired" "${RESURRECT_DIR}/last"
+        echo "Paired resurrect file: $paired"
+    else
+        echo "No paired resurrect file in snapshot; using current 'last'."
+    fi
+
+    # Also pre-point the claude latest symlink so the post-restore hook picks
+    # this snapshot (it would otherwise choose the newest non-empty snapshot,
+    # which may be the post-crash shrunken one).
+    ln -sfn "$(basename "$chosen_file")" "${SNAPSHOTS_DIR}/latest"
+
+    echo "Running tmux-resurrect restore…"
+    # tmux-resurrect's post-restore-all hook will invoke restore-claude-sessions.sh
+    bash "$TMUX_RESURRECT_RESTORE"
+else
+    bash "$RESTORE_SCRIPT" "$chosen_file"
+fi
 
 echo "Done — sessions are resuming in their panes."
 sleep 2

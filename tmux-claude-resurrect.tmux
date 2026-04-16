@@ -27,6 +27,9 @@ chain_hook() {
 
 # Register hooks with tmux-resurrect
 chain_hook "@resurrect-hook-pre-restore-all" "${CURRENT_DIR}/hooks/pre-restore-rename.sh"
+# Protect `last` symlink before we snapshot — so if this save is a regression,
+# save-claude-sessions.sh captures the protected resurrect_file pairing.
+chain_hook "@resurrect-hook-post-save-all" "${CURRENT_DIR}/scripts/protect-last.sh"
 chain_hook "@resurrect-hook-post-save-all" "${CURRENT_DIR}/scripts/save-claude-sessions.sh"
 chain_hook "@resurrect-hook-post-restore-all" "${CURRENT_DIR}/scripts/restore-claude-sessions.sh"
 
