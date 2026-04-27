@@ -127,41 +127,72 @@ fi
 # Socket for TMUX="" isolated new-session calls
 tmux_socket=$(echo "${TMUX:-}" | cut -d',' -f1)
 
-# Create missing sessions and windows first (skip grouped clones — they come last)
-echo "$needed" | sort -u | while IFS=$'\t' read -r session window pane; do
-    [ -z "$session" ] && continue
+# Strict has-session: tmux's default matching is prefix/fnmatch and
+# `has-session -t codex` returns true if `codex-view-...` exists.
+has_session_strict() {
+    tmux has-session -t "=$1" 2>/dev/null
+}
 
-    # Skip grouped session clones — handled after their primary exists
-    if [ -n "${grouped[$session]+x}" ]; then
-        continue
+# Snapshot session names use the live group/session name at save time
+# (typically the clone name like `codex`). The resurrect file's pane lines
+# live on the LEADER (e.g. `codex-view-192701-26655`). For each clone in
+# the snapshot, find its leader so we know where windows actually live.
+resolve_leader() {
+    local sess="$1"
+    if [ -n "${grouped[$sess]+x}" ]; then
+        echo "${grouped[$sess]}"
+    else
+        echo "$sess"
     fi
+}
 
-    if ! tmux has-session -t "$session" 2>/dev/null; then
-        dir="${win_dirs[${session}:${window}]:-$HOME}"
+# Phase 1a: ensure the LEADER session of each snapshot address has the right
+# windows. Snapshot addresses use the live group/session name at save time
+# (typically the clone, e.g. `codex`), but the resurrect file's pane lines
+# live on the leader (`codex-view-192701-26655`). The previous version
+# skipped clones in the loop and never created the leader, so the leader's
+# multi-window structure was missing — and clones (sharing the leader's
+# windows) stayed empty.
+#
+# We only touch leaders that the snapshot actually addresses: this stays a
+# claude/codex restore tool, not a full tmux layout restorer.
+declare -A snapshot_leader_windows
+while IFS=$'\t' read -r session window pane; do
+    [ -z "$session" ] && continue
+    leader="$(resolve_leader "$session")"
+    snapshot_leader_windows["${leader}:${window}"]=1
+done <<< "$needed"
+
+base_idx=$(tmux show -gv base-index 2>/dev/null || echo 0)
+for key in "${!snapshot_leader_windows[@]}"; do
+    sess="${key%:*}"
+    win="${key##*:}"
+
+    if ! has_session_strict "$sess"; then
+        dir="${win_dirs[${sess}:${win}]:-$HOME}"
         [ ! -d "$dir" ] && dir="$HOME"
         if [ -n "$tmux_socket" ]; then
-            TMUX="" tmux -S "$tmux_socket" new-session -d -s "$session" -c "$dir"
+            TMUX="" tmux -S "$tmux_socket" new-session -d -s "$sess" -c "$dir" 2>/dev/null || true
         else
-            tmux new-session -d -s "$session" -c "$dir"
+            tmux new-session -d -s "$sess" -c "$dir" 2>/dev/null || true
         fi
-        # If the first window index needs to be something other than base-index, move it
-        base_idx=$(tmux show -gv base-index 2>/dev/null || echo 0)
-        if [ "$window" != "$base_idx" ]; then
-            tmux move-window -s "${session}:${base_idx}" -t "${session}:${window}" 2>/dev/null || true
+        if [ "$win" != "$base_idx" ] && has_session_strict "$sess"; then
+            tmux move-window -s "${sess}:${base_idx}" -t "${sess}:${win}" 2>/dev/null || true
         fi
     fi
 
-    if ! tmux list-windows -t "$session" -F '#{window_index}' 2>/dev/null | grep -qx "$window"; then
-        dir="${win_dirs[${session}:${window}]:-$HOME}"
+    if has_session_strict "$sess" && \
+       ! tmux list-windows -t "$sess" -F '#{window_index}' 2>/dev/null | grep -qx "$win"; then
+        dir="${win_dirs[${sess}:${win}]:-$HOME}"
         [ ! -d "$dir" ] && dir="$HOME"
-        tmux new-window -d -t "${session}:${window}" -c "$dir"
+        tmux new-window -d -t "${sess}:${win}" -c "$dir" 2>/dev/null || true
     fi
 done
 
-# Create grouped session clones (now their primary exists)
+# Phase 1b: create grouped clone sessions now that their leaders exist.
 for gsess in "${!grouped[@]}"; do
     orig="${grouped[$gsess]}"
-    if tmux has-session -t "$orig" 2>/dev/null && ! tmux has-session -t "$gsess" 2>/dev/null; then
+    if has_session_strict "$orig" && ! has_session_strict "$gsess"; then
         if [ -n "$tmux_socket" ]; then
             TMUX="" tmux -S "$tmux_socket" new-session -d -s "$gsess" -t "$orig" 2>/dev/null || true
         else
@@ -179,25 +210,28 @@ pane_index_exists() {
 }
 
 # Create missing pane splits within windows. Iterate panes in index order so
-# split-window always has an existing pane to split.
+# split-window always has an existing pane to split. For grouped clones the
+# windows physically live on the leader, so look up dirs there too.
 echo "$needed" | sort -u -t$'\t' -k1,1 -k2,2n -k3,3n | while IFS=$'\t' read -r session window pane; do
     [ -z "$session" ] || [ -z "$pane" ] && continue
+    leader="$(resolve_leader "$session")"
 
-    # Pane exists? Nothing to do.
+    # Pane exists? Nothing to do. Splits on a clone propagate to the group, so
+    # check existence via the clone's address (matches how Phase 2 will look).
     if pane_index_exists "$session" "$window" "$pane"; then
         continue
     fi
 
-    # Window must exist (loop above created it); bail if it somehow doesn't.
-    if ! tmux list-windows -t "$session" -F '#{window_index}' 2>/dev/null | grep -qx "$window"; then
+    # Window must exist on the leader (Phase 1a/1b should have made it).
+    if ! tmux list-windows -t "$leader" -F '#{window_index}' 2>/dev/null | grep -qx "$window"; then
         continue
     fi
 
-    dir="${pane_dirs[${session}:${window}.${pane}]:-${win_dirs[${session}:${window}]:-$HOME}}"
+    dir="${pane_dirs[${leader}:${window}.${pane}]:-${win_dirs[${leader}:${window}]:-${pane_dirs[${session}:${window}.${pane}]:-${win_dirs[${session}:${window}]:-$HOME}}}}"
     [ ! -d "$dir" ] && dir="$HOME"
 
     # split-window -t the previous pane in the window (or whatever's active)
-    tmux split-window -d -t "${session}:${window}" -c "$dir" 2>/dev/null || true
+    tmux split-window -d -t "${leader}:${window}" -c "$dir" 2>/dev/null || true
 done
 
 # ----------------------------------------------------------------------------
