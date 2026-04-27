@@ -189,16 +189,61 @@ for key in "${!snapshot_leader_windows[@]}"; do
     fi
 done
 
-# Phase 1b: create grouped clone sessions now that their leaders exist.
+# Phase 1b: ensure each grouped clone is actually grouped with its leader.
+#
+# Two cases the previous code missed:
+#   1) the clone exists, but in a DIFFERENT group than the leader (typical when
+#      pre-restore-rename couldn't catch the conflict — e.g., the leader was
+#      renamed to -stale- but the clone got created later by an i3 launcher
+#      and joined some other "stale" group named after the same root)
+#   2) the clone exists ungrouped while the leader has its own group
+# In both cases the snapshot's clone-keyed addresses (e.g., `codex:1.0`)
+# resolve to a session that doesn't share the leader's windows, so respawn
+# misses every window past 0.
+#
+# Fix: kill the misgrouped clone (preserving its attached clients), recreate
+# it as a proper clone of the leader, and switch the saved clients back.
+recreate_clone_grouped() {
+    local clone="$1" leader="$2"
+    local clients
+    clients=$(tmux list-clients -t "=$clone" -F '#{client_tty}' 2>/dev/null || true)
+    tmux kill-session -t "=$clone" 2>/dev/null || true
+    if [ -n "$tmux_socket" ]; then
+        TMUX="" tmux -S "$tmux_socket" new-session -d -s "$clone" -t "$leader" 2>/dev/null || true
+    else
+        tmux new-session -d -s "$clone" -t "$leader" 2>/dev/null || true
+    fi
+    if [ -n "$clients" ] && has_session_strict "$clone"; then
+        while IFS= read -r tty; do
+            [ -z "$tty" ] && continue
+            tmux switch-client -c "$tty" -t "$clone" 2>/dev/null || true
+        done <<< "$clients"
+    fi
+}
+
 for gsess in "${!grouped[@]}"; do
     orig="${grouped[$gsess]}"
-    if has_session_strict "$orig" && ! has_session_strict "$gsess"; then
+    has_session_strict "$orig" || continue
+
+    if ! has_session_strict "$gsess"; then
         if [ -n "$tmux_socket" ]; then
             TMUX="" tmux -S "$tmux_socket" new-session -d -s "$gsess" -t "$orig" 2>/dev/null || true
         else
             tmux new-session -d -s "$gsess" -t "$orig" 2>/dev/null || true
         fi
+        continue
     fi
+
+    # Both exist — verify they share a group. Note: `display-message` doesn't
+    # expose session_group reliably (returns empty for grouped sessions in
+    # some tmux versions); use `list-sessions -f` filter instead.
+    clone_group=$(tmux list-sessions -f "#{==:#{session_name},$gsess}" -F '#{session_group}' 2>/dev/null || true)
+    leader_group=$(tmux list-sessions -f "#{==:#{session_name},$orig}" -F '#{session_group}' 2>/dev/null || true)
+    if [ -n "$leader_group" ] && [ "$clone_group" = "$leader_group" ]; then
+        continue  # Properly grouped already
+    fi
+
+    recreate_clone_grouped "$gsess" "$orig"
 done
 
 # Strict pane existence check — tmux display-message -t session:W.P falls back
