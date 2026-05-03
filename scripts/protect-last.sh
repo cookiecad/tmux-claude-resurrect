@@ -24,10 +24,18 @@ STATE_DIR="${HOME}/.cache/tmux-claude-resurrect"
 COUNTER_FILE="${STATE_DIR}/protect-consec-small"
 LOG_FILE="${STATE_DIR}/protect-log"
 
-CONSEC_SMALL_LIMIT=5            # after this many in a row, trust the small state
-HWM_WINDOW_COUNT=10             # only consider the N most recent saves as HWM sources
-HWM_MAX_AGE_SECONDS=$((4*3600)) # …and only if the HWM file itself is recent
-MIN_HWM_PANES=4                 # below this, don't bother protecting
+CONSEC_SMALL_LIMIT=5             # after this many in a row, trust the small state
+HWM_WINDOW_COUNT=50              # consider the N most recent saves as HWM sources
+HWM_MAX_AGE_SECONDS=$((7*86400)) # …and only if the HWM file itself is within a week
+MIN_HWM_PANES=4                  # below this, don't bother protecting
+
+# Why 7 days: the original 4-hour window meant any gap in saves longer than
+# 4 hours would orphan the HWM, leaving no anchor. Apr 27 → Apr 30, 2026:
+# saves silently stopped (systemd cgroup-kill bug), `last` aged out of every
+# anchor's window, and recovery restored the impoverished pre-failure state.
+# A week's window covers most outages without preventing legitimate scale-down.
+# HWM_WINDOW_COUNT scales with this — at one save every 5min, 7 days would
+# be 2000+ files; we cap at 50 to bound the scan cost.
 
 mkdir -p "$STATE_DIR"
 
