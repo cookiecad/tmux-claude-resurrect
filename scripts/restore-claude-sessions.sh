@@ -133,33 +133,48 @@ has_session_strict() {
     tmux has-session -t "=$1" 2>/dev/null
 }
 
-# Snapshot session names use the live group/session name at save time
-# (typically the clone name like `codex`). The resurrect file's pane lines
-# live on the LEADER (e.g. `codex-view-192701-26655`). For each clone in
-# the snapshot, find its leader so we know where windows actually live.
+# Resolve a snapshot session-name to the actual session that holds the
+# pane data. Tmux's session lookup is exact (no fuzzy fallback to groups),
+# so a snapshot address like `claude:0.0` only resolves if a session named
+# `claude` exists. We try, in order:
+#   1) it's a clone in the resurrect file → use the leader (column 3 of
+#      `grouped_session`)
+#   2) it's a real session right now (leader, ungrouped, or directly named)
+#   3) it's a tmux GROUP name with members (older snapshots stored the group
+#      name even when no session by that name existed) → use any current
+#      member
+#   4) none of the above → return empty (caller should skip rather than
+#      fabricate a bogus session)
 resolve_leader() {
     local sess="$1"
     if [ -n "${grouped[$sess]+x}" ]; then
         echo "${grouped[$sess]}"
-    else
-        echo "$sess"
+        return
     fi
+    if has_session_strict "$sess"; then
+        echo "$sess"
+        return
+    fi
+    local member
+    member=$(tmux list-sessions -f "#{==:#{session_group},$sess}" -F '#{session_name}' 2>/dev/null | head -1)
+    if [ -n "$member" ]; then
+        echo "$member"
+        return
+    fi
+    echo ""
 }
 
-# Phase 1a: ensure the LEADER session of each snapshot address has the right
-# windows. Snapshot addresses use the live group/session name at save time
-# (typically the clone, e.g. `codex`), but the resurrect file's pane lines
-# live on the leader (`codex-view-192701-26655`). The previous version
-# skipped clones in the loop and never created the leader, so the leader's
-# multi-window structure was missing — and clones (sharing the leader's
-# windows) stayed empty.
-#
-# We only touch leaders that the snapshot actually addresses: this stays a
-# claude/codex restore tool, not a full tmux layout restorer.
+# Phase 1a: ensure each snapshot-addressed (leader, window) exists. Snapshot
+# addresses come from save time and may be either a clone name, a leader
+# name, or — in older snapshots — a tmux group name with no matching
+# session. resolve_leader normalizes all of these to a session that
+# currently exists; if it can't resolve, we skip rather than fabricate a
+# bogus standalone session.
 declare -A snapshot_leader_windows
 while IFS=$'\t' read -r session window pane; do
     [ -z "$session" ] && continue
     leader="$(resolve_leader "$session")"
+    [ -z "$leader" ] && continue   # unresolvable — leave it for Phase 2 to also skip
     snapshot_leader_windows["${leader}:${window}"]=1
 done <<< "$needed"
 
@@ -168,19 +183,8 @@ for key in "${!snapshot_leader_windows[@]}"; do
     sess="${key%:*}"
     win="${key##*:}"
 
-    if ! has_session_strict "$sess"; then
-        dir="${win_dirs[${sess}:${win}]:-$HOME}"
-        [ ! -d "$dir" ] && dir="$HOME"
-        if [ -n "$tmux_socket" ]; then
-            TMUX="" tmux -S "$tmux_socket" new-session -d -s "$sess" -c "$dir" 2>/dev/null || true
-        else
-            tmux new-session -d -s "$sess" -c "$dir" 2>/dev/null || true
-        fi
-        if [ "$win" != "$base_idx" ] && has_session_strict "$sess"; then
-            tmux move-window -s "${sess}:${base_idx}" -t "${sess}:${win}" 2>/dev/null || true
-        fi
-    fi
-
+    # Leader was already resolved to an existing session (or skipped above).
+    # Phase 1a's only remaining job is to add missing windows to that leader.
     if has_session_strict "$sess" && \
        ! tmux list-windows -t "$sess" -F '#{window_index}' 2>/dev/null | grep -qx "$win"; then
         dir="${win_dirs[${sess}:${win}]:-$HOME}"
@@ -260,14 +264,14 @@ pane_index_exists() {
 echo "$needed" | sort -u -t$'\t' -k1,1 -k2,2n -k3,3n | while IFS=$'\t' read -r session window pane; do
     [ -z "$session" ] || [ -z "$pane" ] && continue
     leader="$(resolve_leader "$session")"
+    [ -z "$leader" ] && continue
 
-    # Pane exists? Nothing to do. Splits on a clone propagate to the group, so
-    # check existence via the clone's address (matches how Phase 2 will look).
-    if pane_index_exists "$session" "$window" "$pane"; then
+    # Pane exists? Nothing to do. Splits on a clone propagate to the group.
+    if pane_index_exists "$leader" "$window" "$pane"; then
         continue
     fi
 
-    # Window must exist on the leader (Phase 1a/1b should have made it).
+    # Window must exist on the leader (Phase 1a should have made it).
     if ! tmux list-windows -t "$leader" -F '#{window_index}' 2>/dev/null | grep -qx "$window"; then
         continue
     fi
@@ -329,14 +333,22 @@ for s in snapshot.get('sessions', []):
         s.get('command', '')
     ]))
 " "$snapshot_file" | while IFS=$'\x1f' read -r entry_type session_id address cwd transcript_path permission_mode project_root command; do
-    # Pane must exist at the exact index (Phase 1 should have created it).
-    # Use list-panes because display-message -t sess:W.P silently falls back
-    # to the nearest pane when P doesn't exist.
+    # Translate the snapshot's session name (which may be a clone, a group
+    # name, or a literal session) to one that exists right now. If it can't
+    # be resolved, skip — we don't want to fabricate a session and respawn
+    # claude/codex in the wrong place.
     sess_part="${address%%:*}"
     wp_part="${address#*:}"
     win_part="${wp_part%%.*}"
     pidx_part="${wp_part##*.}"
-    if ! tmux list-panes -t "${sess_part}:${win_part}" -F '#{pane_index}' 2>/dev/null | grep -qx "$pidx_part"; then
+    resolved_sess="$(resolve_leader "$sess_part")"
+    [ -z "$resolved_sess" ] && continue
+    address="${resolved_sess}:${win_part}.${pidx_part}"
+
+    # Pane must exist at the exact index (Phase 1 should have created it).
+    # Use list-panes because display-message -t sess:W.P silently falls back
+    # to the nearest pane when P doesn't exist.
+    if ! tmux list-panes -t "${resolved_sess}:${win_part}" -F '#{pane_index}' 2>/dev/null | grep -qx "$pidx_part"; then
         continue
     fi
 

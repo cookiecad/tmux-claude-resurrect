@@ -114,14 +114,47 @@ def find_codex_session_id(pid):
     return ""
 
 
-def list_panes():
+def read_grouped_leaders(resurrect_file_basename):
+    """Map clone_session_name → leader_session_name from the paired resurrect
+    file's grouped_session lines.
+
+    Why we need this: tmux exposes a session_group "name" that's frequently
+    just a string with no matching session (the original session got
+    renamed/killed but the group lingers). If we encode that as the snapshot
+    address, restore can't look it up — `tmux list-panes -t claude:0` returns
+    "can't find session: claude" with no fuzzy fallback. The resurrect file's
+    grouped_session lines DO record a real leader (column 3 = the session
+    that holds the actual pane lines), so we use that as the canonical name.
+    """
+    leaders = {}
+    if not resurrect_file_basename:
+        return leaders
+    full = RESURRECT_DIR / resurrect_file_basename
+    if not full.exists():
+        return leaders
+    try:
+        with open(full) as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) >= 3 and parts[0] == "grouped_session":
+                    leaders[parts[1]] = parts[2]
+    except OSError:
+        pass
+    return leaders
+
+
+def list_panes(group_leaders):
     """Yield (pane_pid:int, pane_id:str, pane_cmd, addr, cwd) for each unique
     pane, collapsing grouped-session clones to one entry per pane_id.
+
+    `group_leaders` maps clone session names to leader names (from the paired
+    resurrect file). If a pane's session is a clone, we rewrite the address
+    to use the leader's name so it resolves at restore time.
     """
     fmt = (
-        "#{pane_pid}\t#{pane_id}\t#{pane_current_command}\t"
-        "#{?session_grouped,#{session_group},#{session_name}}"
-        ":#{window_index}.#{pane_index}\t#{pane_current_path}"
+        "#{pane_pid}\t#{pane_id}\t#{pane_current_command}\t#{session_name}\t"
+        "#{?session_grouped,1,0}\t#{window_index}\t#{pane_index}\t"
+        "#{pane_current_path}"
     )
     try:
         out = subprocess.run(
@@ -135,12 +168,17 @@ def list_panes():
     seen = set()
     for line in out.splitlines():
         parts = line.split("\t")
-        if len(parts) != 5:
+        if len(parts) != 8:
             continue
-        pid_s, pane_id, cmd, addr, cwd = parts
+        pid_s, pane_id, cmd, sess, grouped, win, pane, cwd = parts
         if pane_id in seen:
             continue
         seen.add(pane_id)
+        # Canonicalize grouped clones to the resurrect-file leader's name.
+        # Sessions that are themselves leaders (or ungrouped) pass through.
+        if grouped == "1":
+            sess = group_leaders.get(sess, sess)
+        addr = f"{sess}:{win}.{pane}"
         try:
             yield int(pid_s), pane_id, cmd, addr, cwd
         except ValueError:
@@ -172,9 +210,10 @@ def main():
     proc_by_pid, children = read_proc_table()
     now = time.time()
     paired = paired_resurrect_file()
+    group_leaders = read_grouped_leaders(paired)
     sessions = []
 
-    for pane_pid, pane_id, pane_cmd, addr, cwd in list_panes():
+    for pane_pid, pane_id, pane_cmd, addr, cwd in list_panes(group_leaders):
         pane_number = pane_id.lstrip("%")
 
         # ---- Claude detection ----
